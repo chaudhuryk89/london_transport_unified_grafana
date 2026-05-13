@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: TfL PostGIS
+    uid: tfl-pg
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: tfl_bus
+    user: tfl
+    secureJsonData:
+      password: tfl_secret
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false

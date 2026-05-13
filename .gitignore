@@ -1,0 +1,11 @@
+.env.local
+target/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+__pycache__/
+*.py[cod]
+.venv/
+venv/

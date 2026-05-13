@@ -1,0 +1,174 @@
+# One image for JobManager, TaskManager, and submit-job so Python UDF code cannot drift
+# (Compose otherwise tags per-service images; rebuilding only submit-job leaves stale TMs).
+x-flink-app: &flink_app
+  image: ltuf-flink-java:1.18.1
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.flink-job
+
+services:
+  tick-feed:
+    image: python:3.10-slim
+    environment:
+      TICK_MS: ${TFL_POLL_INTERVAL_MS:-30000}
+    command:
+      - python
+      - -u
+      - -c
+      - |
+          import os, socket, threading, time
+          delay = max(1.0, float(os.environ.get("TICK_MS", "30000")) / 1000.0)
+          def handle(c):
+              try:
+                  while True:
+                      c.sendall(b"tick\n")
+                      time.sleep(delay)
+              except Exception:
+                  pass
+              finally:
+                  try:
+                      c.close()
+                  except Exception:
+                      pass
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("0.0.0.0", 9999))
+          s.listen(32)
+          print("tick-feed listening on :9999", flush=True)
+          while True:
+              c, a = s.accept()
+              threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tfl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfl_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-tfl_bus}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tfl} -d ${POSTGRES_DB:-tfl_bus}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  jobmanager:
+    <<: *flink_app
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      TFL_APP_KEY: ${TFL_APP_KEY:-}
+      TFL_APP_ID: ${TFL_APP_ID:-}
+      TFL_HUB_STOP_TYPES: ${TFL_HUB_STOP_TYPES:-}
+      TFL_GHOST_DEFAULT_SEGMENT_SECS: ${TFL_GHOST_DEFAULT_SEGMENT_SECS:-360}
+      TFL_POLL_INTERVAL_MS: ${TFL_POLL_INTERVAL_MS:-30000}
+      TFL_ARRIVAL_POLL_PARALLELISM: ${TFL_ARRIVAL_POLL_PARALLELISM:-32}
+      FLINK_JDBC_URL: ${FLINK_JDBC_URL:-jdbc:postgresql://postgres:5432/tfl_bus}
+      JDBC_USER: ${POSTGRES_USER:-tfl}
+      JDBC_PASSWORD: ${POSTGRES_PASSWORD:-tfl_secret}
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tick-feed:
+        condition: service_started
+
+  taskmanager:
+    <<: *flink_app
+    command: taskmanager
+    scale: 1
+    environment:
+      TFL_APP_KEY: ${TFL_APP_KEY:-}
+      TFL_APP_ID: ${TFL_APP_ID:-}
+      TFL_HUB_STOP_TYPES: ${TFL_HUB_STOP_TYPES:-}
+      TFL_GHOST_DEFAULT_SEGMENT_SECS: ${TFL_GHOST_DEFAULT_SEGMENT_SECS:-360}
+      TFL_POLL_INTERVAL_MS: ${TFL_POLL_INTERVAL_MS:-30000}
+      TFL_ARRIVAL_POLL_PARALLELISM: ${TFL_ARRIVAL_POLL_PARALLELISM:-32}
+      FLINK_JDBC_URL: ${FLINK_JDBC_URL:-jdbc:postgresql://postgres:5432/tfl_bus}
+      JDBC_USER: ${POSTGRES_USER:-tfl}
+      JDBC_PASSWORD: ${POSTGRES_PASSWORD:-tfl_secret}
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+    depends_on:
+      jobmanager:
+        condition: service_started
+      tick-feed:
+        condition: service_started
+
+  submit-job:
+    <<: *flink_app
+    user: "flink:flink"
+    environment:
+      TFL_APP_KEY: ${TFL_APP_KEY:-}
+      TFL_APP_ID: ${TFL_APP_ID:-}
+      TFL_HUB_STOP_TYPES: ${TFL_HUB_STOP_TYPES:-}
+      TFL_GHOST_DEFAULT_SEGMENT_SECS: ${TFL_GHOST_DEFAULT_SEGMENT_SECS:-360}
+      TFL_POLL_INTERVAL_MS: ${TFL_POLL_INTERVAL_MS:-30000}
+      TFL_ARRIVAL_POLL_PARALLELISM: ${TFL_ARRIVAL_POLL_PARALLELISM:-32}
+      FLINK_JDBC_URL: ${FLINK_JDBC_URL:-jdbc:postgresql://postgres:5432/tfl_bus}
+      JDBC_USER: ${POSTGRES_USER:-tfl}
+      JDBC_PASSWORD: ${POSTGRES_PASSWORD:-tfl_secret}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jobmanager:
+        condition: service_started
+      taskmanager:
+        condition: service_started
+      tick-feed:
+        condition: service_started
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        echo "Waiting for Flink JobManager REST + TaskManager slots..."
+        for i in {1..90}; do
+          if /opt/flink/bin/flink list -m jobmanager:8081 >/dev/null 2>&1; then
+            break
+          fi
+          sleep 2
+        done
+        ready=0
+        for i in {1..90}; do
+          if body=$$(curl -fsS --max-time 5 "http://jobmanager:8081/overview" 2>/dev/null); then
+            slots=$$(printf '%s' "$$body" | grep -o '"slots-total":[0-9]*' | head -1 | cut -d: -f2)
+            tms=$$(printf '%s' "$$body" | grep -o '"taskmanagers":[0-9]*' | head -1 | cut -d: -f2)
+            [ -z "$$slots" ] && slots=0
+            [ -z "$$tms" ] && tms=0
+            if [ "$$slots" -gt 0 ] && [ "$$tms" -gt 0 ]; then
+              echo "Flink cluster ready: taskmanagers=$$tms, slots-total=$$slots"
+              ready=1
+              break
+            fi
+          else
+            echo "waiting for Flink overview..."
+          fi
+          sleep 2
+        done
+        if [ "$$ready" -ne 1 ]; then
+          echo "Timed out waiting for TaskManagers with slots (check taskmanager logs)" >&2
+          exit 1
+        fi
+        exec /opt/flink/bin/flink run -m jobmanager:8081 -c com.londontransport.flink.TflBusStreamingJob /opt/flink/usrlib/flink-tfl-bus.jar
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

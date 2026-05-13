@@ -1,0 +1,64 @@
+{
+  "uid": "tfl-bus-geomap",
+  "title": "TfL buses (hub arrivals)",
+  "tags": ["tfl", "postgis"],
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 2,
+      "title": "Database row counts",
+      "type": "table",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "tfl-pg" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT 'hub_stops' AS table_name, count(*)::bigint AS rows FROM hub_stops\nUNION ALL\nSELECT 'bus_positions', count(*)::bigint FROM bus_positions",
+          "datasource": { "type": "postgres", "uid": "tfl-pg" }
+        }
+      ],
+      "options": { "showHeader": true, "cellHeight": "sm" }
+    },
+    {
+      "id": 1,
+      "title": "Latest bus positions",
+      "type": "geomap",
+      "gridPos": { "h": 17, "w": 24, "x": 0, "y": 5 },
+      "datasource": { "type": "postgres", "uid": "tfl-pg" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT vehicle_id,\n       route,\n       time AS \"time\",\n       ST_Y(location::geometry) AS latitude,\n       ST_X(location::geometry) AS longitude,\n       bearing\nFROM (\n  SELECT DISTINCT ON (vehicle_id) vehicle_id, route, time, location, bearing\n  FROM bus_positions\n  ORDER BY vehicle_id, time DESC\n) x\nWHERE location IS NOT NULL",
+          "datasource": { "type": "postgres", "uid": "tfl-pg" }
+        }
+      ],
+      "options": {
+        "view": { "id": "coords", "lat": 51.507, "lon": -0.127, "zoom": 11 },
+        "layers": [
+          {
+            "type": "markers",
+            "config": {
+              "style": {
+                "size": { "fixed": 10 },
+                "symbol": { "fixed": "img/icons/marker/circle.svg" },
+                "color": { "fixed": "dark-green" }
+              },
+              "showLegend": true,
+              "location": {
+                "mode": "coords",
+                "latitude": "latitude",
+                "longitude": "longitude"
+              }
+            }
+          }
+        ]
+      },
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    }
+  ]
+}

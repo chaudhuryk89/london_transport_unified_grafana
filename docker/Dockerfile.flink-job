@@ -1,0 +1,15 @@
+# Flink image with Java streaming job JAR (no PyFlink / Python worker).
+FROM maven:3.9.6-eclipse-temurin-11 AS build
+WORKDIR /build
+COPY flink-tfl-bus/pom.xml .
+COPY flink-tfl-bus/src ./src
+RUN mvn -q -DskipTests package
+
+FROM flink:1.18.1-java11
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/flink/usrlib
+COPY --from=build /build/target/flink-tfl-bus.jar ./flink-tfl-bus.jar
+USER flink
